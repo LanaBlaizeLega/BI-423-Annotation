@@ -1,4 +1,5 @@
 import sys
+import textwrap
 from pathlib import Path
 from typing import List, NamedTuple, Tuple
 
@@ -12,15 +13,20 @@ from PyQt6.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QLineEdit,
     QMainWindow,
     QMenuBar,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QSplitter,
     QStatusBar,
+    QTableWidget,
+    QTableWidgetItem,
     QTabWidget,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -362,6 +368,169 @@ class GenomeAnalyzer:
             return pos_start_plus_0 + 1, pos_end_plus_0 + 1
 
 
+class ResultsPanel(QScrollArea):
+    """Panneau droit affichant les résultats d'annotation dans un tableau formaté."""
+
+    signal_copy_output = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumWidth(400)
+        self.setWidgetResizable(True)
+
+        self.content = QWidget()
+        self.content.setLayout(QVBoxLayout())
+        layout = self.content.layout()
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(8)
+
+        lbl_title = QLabel("Résultats d'Annotation")
+        lbl_title.setStyleSheet(
+            "font-size: 14px; font-weight: bold; color: #333; margin: 4px;"
+        )
+        layout.addWidget(lbl_title)
+
+        self.features_table = QTableWidget()
+        self.features_table.setColumnCount(7)
+        self.features_table.setHorizontalHeaderLabels(
+            ["Type", "Brin", "Début", "Fin", "Long.", "Phase", "Notes"]
+        )
+        header = self.features_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.features_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectItems
+        )
+        self.features_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.features_table.setStyleSheet(
+            "QTableWidget { gridcolor: #ddd; alternate-background-color: #f5f5f5; }"
+            "QHeaderView::section { background: #4CAF50; color: white; padding: 4px; font-weight: bold; }"
+        )
+        layout.addWidget(self.features_table)
+
+        lbl_formatted = QLabel("Sortie formatée :")
+        lbl_formatted.setStyleSheet(
+            "font-size: 12px; font-weight: bold; color: #555; margin-top: 8px;"
+        )
+        layout.addWidget(lbl_formatted)
+
+        self.txt_output = QTextEdit()
+        self.txt_output.setReadOnly(True)
+        self.txt_output.setFont(QFont("Inconsolata", 10))
+        self.txt_output.setStyleSheet(
+            "background-color: #FAFAFA; border: 1px solid #ccc; padding: 6px;"
+        )
+        layout.addWidget(self.txt_output)
+
+        btn_copy = QPushButton("Copier la sortie")
+        btn_copy.clicked.connect(self.on_copy_clicked)
+        layout.addWidget(btn_copy)
+
+        layout.addStretch()
+
+        self.setWidget(self.content)
+
+    def on_copy_clicked(self):
+        text = self.txt_output.toPlainText()
+        QApplication.clipboard().setText(text)
+        self.signal_copy_output.emit("Sortie copiée !")
+
+    def clear_results(self):
+        self.features_table.setRowCount(0)
+        self.txt_output.clear()
+
+    def update_results(self, features, total_length=0):
+        self.clear_results()
+        if not features:
+            self.features_table.setRowCount(1)
+            self.features_table.setItem(0, 0, QTableWidgetItem("Aucun résultat."))
+            self.features_table.horizontalHeader().hide()
+            return
+
+        sorted_features = sorted(features, key=lambda f: (f.start, f.strand == "-"))
+        self.features_table.setRowCount(len(sorted_features))
+        for row, feat in enumerate(sorted_features):
+            self.features_table.setItem(row, 0, QTableWidgetItem(feat.type))
+            self.features_table.setItem(row, 1, QTableWidgetItem(feat.strand))
+            self.features_table.setItem(row, 2, QTableWidgetItem(str(feat.start)))
+            self.features_table.setItem(row, 3, QTableWidgetItem(str(feat.end)))
+            self.features_table.setItem(row, 4, QTableWidgetItem(str(feat.length)))
+            phase = ((feat.start - 1) % 3) + 1
+            phase_str = f"+{phase}" if feat.strand == "+" else f"-{phase}"
+            self.features_table.setItem(row, 5, QTableWidgetItem(phase_str))
+            note_item = QTableWidgetItem(feat.sequence[:20])
+            note_item.setToolTip(feat.sequence)
+            self.features_table.setItem(row, 6, note_item)
+
+        formatted_lines = self._generate_formatted_output(sorted_features, total_length)
+        self.txt_output.setPlainText("\n".join(formatted_lines))
+
+    def _generate_formatted_output(self, features, total_length=0):
+        lines = []
+        cdss = [f for f in features if f.type == "CDS"]
+        rbses = [f for f in features if f.type == "RBS"]
+        promoters = [f for f in features if f.type == "Promoter"]
+
+        for cds in cdss:
+            start, end = cds.start, cds.end
+            if cds.strand == "-":
+                new_start = total_length - cds.end + 1
+                new_end = total_length - cds.start + 1
+                start, end = int(new_start), int(new_end)
+
+            lines.append(f"Les coordonnées de CDS: complément({start}…{end})")
+            lines.append(f"La longueur de la séquence: {cds.length}")
+
+            if cds.strand == "-":
+                start_atg = total_length - cds.end + 1
+            else:
+                start_atg = cds.start
+            lines.append(
+                f"La position du codon start: complément({max(1, start_atg)}…{start_atg + 2})"
+            )
+
+            for rbs in rbses:
+                if cds.strand == "+":
+                    dist = cds.start - rbs.end
+                else:
+                    dist = rbs.start - cds.end
+                if 6 <= dist <= 12:
+                    lines.append(
+                        f"La position du Shine-Dalgarno: complément({rbs.start}…{rbs.end})"
+                    )
+                    break
+
+            for prom in promoters:
+                if cds.strand == "+":
+                    dist = cds.start - prom.end
+                else:
+                    dist = prom.start - cds.end
+                if 30 <= dist <= 40:
+                    lines.append(
+                        f"La position de boîte -35: complément({prom.start}…{prom.end})"
+                    )
+                    break
+
+            for prom in promoters:
+                if cds.strand == "+":
+                    dist = cds.start - prom.end
+                else:
+                    dist = prom.start - cds.end
+                if 8 <= dist <= 12:
+                    lines.append(
+                        f"La position de boîte -10: complément({prom.start}…{prom.end})"
+                    )
+                    break
+
+            phase = ((start - 1) % 3) + 1
+            lines.append(f"La phase de lecture: {cds.strand}{phase}")
+            lines.append("")
+
+        if not lines:
+            lines.append("Aucune annotation à afficher.")
+
+        return lines
+
+
 class AnnotationPanel(QWidget):
     """Panneau gauche contenant les modules de détection et d'annotation."""
 
@@ -401,7 +570,7 @@ class AnnotationPanel(QWidget):
 
         cb_container = QWidget()
         cb_layout = QHBoxLayout(cb_container)
-        cb_layout.setContentsMargins(0, 0, 0, 0)  # Supprime les marges internes
+        cb_layout.setContents   Margins(0, 0, 0, 0)  # Supprime les marges internes
         cb_layout.addWidget(self.cb_fwd)
         cb_layout.addWidget(self.rev_cb)
 
@@ -558,6 +727,8 @@ class MainWindow(QMainWindow):
         # Panneau gauche
         self.left_panel = AnnotationPanel(self)
 
+        self.results_panel = ResultsPanel(self)
+
         # Connexions signaux
         self.browser.position_changed.connect(self.update_status_bar_cursor)
 
@@ -572,15 +743,21 @@ class MainWindow(QMainWindow):
     def setup_ui(self):
         central = QWidget()
 
-        splitter = QSplitter(Qt.Orientation.Horizontal)
-        splitter.addWidget(self.left_panel)
-        splitter.addWidget(self.browser)
-        splitter.setSizes([350, 850])
+        splitter_center = QSplitter(Qt.Orientation.Horizontal)
+        splitter_center.addWidget(self.browser)
+        splitter_center.addWidget(self.results_panel)
+
+        main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        main_splitter.addWidget(self.left_panel)
+        main_splitter.addWidget(splitter_center)
+
+        main_splitter.setSizes([300, 900])
+        splitter_center.setSizes([850, 400])
 
         main_layout = QVBoxLayout(central)
         main_layout.setContentsMargins(0, 0, 0, 0)
 
-        main_layout.addWidget(splitter)
+        main_layout.addWidget(main_splitter)
         self.setCentralWidget(central)
 
     def setup_menu(self):
@@ -604,6 +781,7 @@ class MainWindow(QMainWindow):
         )
         if filepath:
             self.browser.load_fasta(filepath)
+            self.results_panel.clear_results()
 
     def update_status_bar_cursor(self, pos, base):
         """Mise à jour du statusBar ET de l'input manuel dans le panneau gauche"""
@@ -622,11 +800,13 @@ class MainWindow(QMainWindow):
             return
 
         seq_len = len(self.browser.sequence)
+
         cds_list = GenomeAnalyzer.find_orfs(
             sequence=self.browser.sequence, min_length=min_len, forward=fwd, reverse=rev
         )
-        cds_list.sort(key=lambda x: x.start)
-        print(f"  - Trouvé {len(cds_list)} CDS candidats.")
+        all_features = list(cds_list)
+
+        self.results_panel.update_results(all_features, total_length=seq_len)
         msg = f"Détecté : {len(cds_list)} CDS. "
         for i, cds in enumerate(cds_list):
             start = cds.start
@@ -651,17 +831,31 @@ class MainWindow(QMainWindow):
         if not self.browser.sequence:
             return
 
-        # Recherche RBS (ex: dans les 500 premiers nucléotides pour l'exemple)
         rbs_found = GenomeAnalyzer.find_motifs(
             sequence=self.browser.sequence,
             motif=rbs_motif,
             window_start=1,
-            window_end=min(
-                2000, len(self.browser.sequence)
-            ),  # Limite arbitraire pour l'exemple
-        )
-
+            window_end=seq_len,
+            )
+        prom_35_found = GenomeAnalyzer.find_motifs(
+            sequence=self.browser.sequence,
+            motif=prom_35,
+            window_start=1,
+            window_end=seq_len,
+            )
+        prom_10_found = GenomeAnalyzer.find_motifs(
+            sequence=self.browser.sequence,
+            motif=prom_10,
+            window_start=1,
+            window_end=seq_len,
+            )
         print(f"  - Motif RBS '{rbs_motif}' trouvé {len(rbs_found)} fois.")
+        print(f"  - Boîte -35 '{prom_35}' trouvée {len(prom_35_found)} fois.")
+        current_features = []
+        all_features = rbs_found + prom_35_found + prom_10_found
+
+        self.results_panel.update_results(all_features, total_length=seq_len)
+
 
     def update_status(self, pos, base):
         self.lbl_pos.setText(f"Position: {pos} nt | Base: {base}")
