@@ -264,10 +264,11 @@ class GenomeAnalyzer:
             Liste des Features trouvés.
         """
         found = []
-        search_seq = sequence[window_start - 1 : window_end]
+        search_seq_plus = sequence[window_start - 1 : window_end]
 
-        for i in range(len(search_seq) - len(motif) + 1):
-            if search_seq[i : i + len(motif)] == motif:
+        # 1. Recherche sur le brin +
+        for i in range(len(search_seq_plus) - len(motif) + 1):
+            if search_seq_plus[i : i + len(motif)] == motif:
                 abs_pos = window_start + i  # Position absolue dans la séquence globale
                 found.append(
                     Feature(
@@ -281,13 +282,37 @@ class GenomeAnalyzer:
                         length=len(motif),
                     )
                 )
+
+        # 2. Recherche sur le brin - (motif inverse complémentaire)
+                rev_seq = GenomeAnalyzer.reverse_complement(sequence)
+                search_seq_rev = rev_seq[window_start - 1 : window_end]
+
+                for i in range(len(search_seq_rev) - len(motif) + 1):
+                    if search_seq_rev[i : i + len(motif)] == motif:
+                        idx_abs_0 = window_start - 1 + i
+                        start_0_plus = len(sequence) - 1 - (idx_abs_0 + len(motif) - 1)
+                        end_0_plus = len(sequence) - 1 - idx_abs_0
+                        abs_pos_plus_1 = start_0_plus + 1
+                        abs_end_plus_1 = end_0_plus + 1
+
+                        found.append(
+                            Feature(
+                            type="Promoter" if "TTGACA" in motif or "TATAAT" in motif else "RBS",
+                            start=abs_pos_plus_1,
+                            end=abs_end_plus_1,
+                            strand="-",
+                            sequence=motif,
+                            length=len(motif),
+                        )
+                    )
+
         return found
 
     @staticmethod
     def find_rbs_upstream(
         sequence: str,
         cds_feature: Feature,
-        motif_pattern: str = "AGGAGGUAA",
+        motif_pattern: str = "AGGAGG",
         upstream_dist_min: int = 6,
         upstream_dist_max: int = 12,
     ) -> List[Feature]:
@@ -390,6 +415,9 @@ class ResultsPanel(QScrollArea):
         )
         layout.addWidget(lbl_title)
 
+        self.current_features = [] # Stocke la liste actuelle des features
+
+
         self.features_table = QTableWidget()
         self.features_table.setColumnCount(7)
         self.features_table.setHorizontalHeaderLabels(
@@ -438,15 +466,27 @@ class ResultsPanel(QScrollArea):
         self.features_table.setRowCount(0)
         self.txt_output.clear()
 
-    def update_results(self, features, total_length=0):
-        self.clear_results()
-        if not features:
+    def update_results(self, new_features, total_length=0):
+        existing_keys = {(f.start, f.end, f.type, f.strand) for f in self.current_features}
+
+        unique_new_features = []
+        for feat in new_features:
+            key = (feat.start, feat.end, feat.type, feat.strand)
+            if key not in existing_keys:
+                unique_new_features.append(feat)
+                existing_keys.add(key)
+
+        self.current_features.extend(unique_new_features)
+
+        if not self.current_features:
             self.features_table.setRowCount(1)
             self.features_table.setItem(0, 0, QTableWidgetItem("Aucun résultat."))
             self.features_table.horizontalHeader().hide()
+            self.txt_output.clear()
             return
 
-        sorted_features = sorted(features, key=lambda f: (f.start, f.strand == "-"))
+        sorted_features = sorted(self.current_features, key=lambda f: (f.start, f.strand == "-"))
+
         self.features_table.setRowCount(len(sorted_features))
         for row, feat in enumerate(sorted_features):
             self.features_table.setItem(row, 0, QTableWidgetItem(feat.type))
@@ -454,81 +494,129 @@ class ResultsPanel(QScrollArea):
             self.features_table.setItem(row, 2, QTableWidgetItem(str(feat.start)))
             self.features_table.setItem(row, 3, QTableWidgetItem(str(feat.end)))
             self.features_table.setItem(row, 4, QTableWidgetItem(str(feat.length)))
+
+            # Calcul de la phase de lecture
             phase = ((feat.start - 1) % 3) + 1
             phase_str = f"+{phase}" if feat.strand == "+" else f"-{phase}"
             self.features_table.setItem(row, 5, QTableWidgetItem(phase_str))
+
             note_item = QTableWidgetItem(feat.sequence[:20])
             note_item.setToolTip(feat.sequence)
             self.features_table.setItem(row, 6, note_item)
 
+        # Mise à jour de la sortie formatée avec toutes les données actuelles
         formatted_lines = self._generate_formatted_output(sorted_features, total_length)
         self.txt_output.setPlainText("\n".join(formatted_lines))
 
+
     def _generate_formatted_output(self, features, total_length=0):
         lines = []
+
+        if not features:
+            return ["Aucune annotation à afficher."]
+
         cdss = [f for f in features if f.type == "CDS"]
         rbses = [f for f in features if f.type == "RBS"]
-        promoters = [f for f in features if f.type == "Promoter"]
+        promoters_35 = [f for f in features if f.type == "Promoter" and f.sequence == "TTGACA"]
+        promoters_10 = [f for f in features if f.type == "Promoter" and f.sequence == "TATAAT"]
 
-        for cds in cdss:
-            start, end = cds.start, cds.end
-            if cds.strand == "-":
-                new_start = total_length - cds.end + 1
-                new_end = total_length - cds.start + 1
-                start, end = int(new_start), int(new_end)
+        if not cdss:
+            return ["Aucun CDS détecté."]
 
-            lines.append(f"Les coordonnées de CDS: complément({start}…{end})")
-            lines.append(f"La longueur de la séquence: {cds.length}")
+        cds = sorted(cdss, key=lambda x: x.start)[0]
 
-            if cds.strand == "-":
-                start_atg = total_length - cds.end + 1
+        start, end = cds.start, cds.end
+        # Gestion des coordonnées pour l'affichage "complément" si sur brin -
+        if cds.strand == "-":
+            comp_start = total_length - cds.end + 1
+            comp_end = total_length - cds.start + 1
+            start_out, end_out = int(comp_start), int(comp_end)
+        else:
+            start_out, end_out = int(start), int(end)
+
+        lines.append(f"Les coordonnées de CDS: complément({start}…{end})")
+        lines.append(f"La longueur de la séquence: {cds.length}")
+
+        if cds.strand == "-":
+            atg_pos = total_length - cds.end + 1
+        else:
+            atg_pos = cds.start
+        lines.append(
+        f"La position du codon start: complément({max(1, atg_pos)}…{atg_pos + 2})"
+        )
+
+            # --- Association RBS ---
+        best_rbs = None
+        min_dist_diff = float('inf')
+
+        for rbs in rbses:
+            if cds.strand == "+":
+                dist = cds.start - rbs.end
             else:
-                start_atg = cds.start
+                dist = rbs.start - cds.end
+            if 6 <= dist <= 12:
+                diff = abs(dist -8)
+                if diff < min_dist_diff:
+                    min_dist_diff = diff
+                    best_rbs = rbs
+        if best_rbs:
             lines.append(
-                f"La position du codon start: complément({max(1, start_atg)}…{start_atg + 2})"
+            f"La position du Shine-Dalgarno: complément({best_rbs.start}…{best_rbs.end})"
             )
+        else:
+            lines.append("La position du Shine-Dalgarno: Non trouvé")
 
-            for rbs in rbses:
-                if cds.strand == "+":
-                    dist = cds.start - rbs.end
-                else:
-                    dist = rbs.start - cds.end
-                if 6 <= dist <= 12:
-                    lines.append(
-                        f"La position du Shine-Dalgarno: complément({rbs.start}…{rbs.end})"
-                    )
-                    break
+            # --- Association Boîte -35 ---
+        best_prom_35 = None
+        min_dist_diff_35 = float('inf')
 
-            for prom in promoters:
-                if cds.strand == "+":
-                    dist = cds.start - prom.end
-                else:
-                    dist = prom.start - cds.end
-                if 30 <= dist <= 40:
-                    lines.append(
-                        f"La position de boîte -35: complément({prom.start}…{prom.end})"
-                    )
-                    break
+        for prom in promoters_35:
+            if cds.strand == "+":
+                dist = cds.start - prom.end
+            else:
+                dist = prom.start - cds.end
+            if 30 <= dist <= 40:
+                diff = abs(dist - 35)
+                if diff < min_dist_diff_35:
+                    min_dist_diff_35 = diff
+                    best_prom_35 = prom
+                    if best_prom_35:
+                        lines.append(
+                        f"La position de boîte -35: complément({best_prom_35.start}…{best_prom_35.end})"
+                        )
+                    else:
+                        lines.append("La position de boîte -35: Non trouvé")
 
-            for prom in promoters:
-                if cds.strand == "+":
-                    dist = cds.start - prom.end
-                else:
-                    dist = prom.start - cds.end
-                if 8 <= dist <= 12:
-                    lines.append(
-                        f"La position de boîte -10: complément({prom.start}…{prom.end})"
-                    )
-                    break
+            # --- Association Boîte -10 ---
+        best_prom_10 = None
+        min_dist_diff_10 = float('inf')
 
-            phase = ((start - 1) % 3) + 1
-            lines.append(f"La phase de lecture: {cds.strand}{phase}")
-            lines.append("")
+        for prom in promoters_10:
+            if cds.strand == "+":
+                dist = cds.start - prom.end
+            else:
+                dist = prom.start - cds.end
+            if 8 <= dist <= 20:
+                diff = abs(dist - 10)
+                if diff < min_dist_diff_10:
+                    min_dist_diff_10 = diff
+                    best_prom_10 = prom
+        if best_prom_10:
+            lines.append(
+            f"La position de boîte -10: complément({best_prom_10.start}…{best_prom_10.end})"
+            )
+        else:
+            lines.append("La position de boîte -10: Non trouvé")
+
+        phase = ((start - 1) % 3) + 1
+        lines.append(f"La phase de lecture: {cds.strand}{phase}")
+        lines.append("")
 
         if not lines:
             lines.append("Aucune annotation à afficher.")
 
         return lines
+
 
 
 class AnnotationPanel(QWidget):
@@ -570,7 +658,7 @@ class AnnotationPanel(QWidget):
 
         cb_container = QWidget()
         cb_layout = QHBoxLayout(cb_container)
-        cb_layout.setContents   Margins(0, 0, 0, 0)  # Supprime les marges internes
+        cb_layout.setContentsMargins(0, 0, 0, 0)  # Supprime les marges internes
         cb_layout.addWidget(self.cb_fwd)
         cb_layout.addWidget(self.rev_cb)
 
@@ -601,7 +689,7 @@ class AnnotationPanel(QWidget):
         grp_params = QGroupBox("Motifs et Paramètres")
         lay_grp = QFormLayout(grp_params)
 
-        self.le_rbs_motif = QLineEdit("AGGAGGUAA")
+        self.le_rbs_motif = QLineEdit("AGGAGG")
         self.le_prom_35 = QLineEdit("TTGACA")
         self.le_prom_10 = QLineEdit("TATAAT")
 
@@ -660,7 +748,7 @@ class AnnotationPanel(QWidget):
         self.sp_feat_end = QSpinBox()
         # On simule une plage, à connecter au chargement FASTA
 
-        btn_add = QPushButton("➕ Ajouter à l'annotation")
+        btn_add = QPushButton("Ajouter à l'annotation")
 
         lay_feat.addRow("Type:", self.cbx_type)
         lay_feat.addRow("Start:", self.sp_feat_start)
@@ -826,10 +914,17 @@ class MainWindow(QMainWindow):
 
     def on_action_search_motifs(self, rbs_motif, prom_35, prom_10):
         """Slot pour la recherche de motifs RBS et Promoteurs"""
-        print(f"--- RECHERCHE MOTIFS ---")
+        print("--- RECHERCHE MOTIFS ---")
 
         if not self.browser.sequence:
             return
+
+        seq_len = len(self.browser.sequence)
+
+        # On récupère les résultats existants (CDS + anciens motifs)
+        existing_features = list(self.results_panel.current_features)
+
+
 
         rbs_found = GenomeAnalyzer.find_motifs(
             sequence=self.browser.sequence,
@@ -849,10 +944,13 @@ class MainWindow(QMainWindow):
             window_start=1,
             window_end=seq_len,
             )
+
+        new_features = rbs_found + prom_35_found + prom_10_found
+        all_features = existing_features + new_features
+
         print(f"  - Motif RBS '{rbs_motif}' trouvé {len(rbs_found)} fois.")
         print(f"  - Boîte -35 '{prom_35}' trouvée {len(prom_35_found)} fois.")
-        current_features = []
-        all_features = rbs_found + prom_35_found + prom_10_found
+        print(f"  - Boîte -10 '{prom_10}' trouvée {len(prom_10_found)} fois.")
 
         self.results_panel.update_results(all_features, total_length=seq_len)
 
